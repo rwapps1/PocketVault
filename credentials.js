@@ -10,10 +10,10 @@
 // (same timing as the fingerprint lock), you tap the lock button, or the
 // app is closed.
 
-import { col, doc, confirmDialog } from "./app.js";
+import { col, doc, confirmDialog, db } from "./app.js";
 import { lockEnabled, lockAfterMs } from "./lock.js";
 import {
-  onSnapshot, setDoc, deleteDoc, doc as fsDoc
+  onSnapshot, setDoc, deleteDoc, writeBatch, doc as fsDoc
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 //   pocketvault/{you}/meta/credentials  { v, iter, saltP, wrapP {iv, ct}, saltR, wrapR {iv, ct}, hint }
@@ -435,7 +435,7 @@ export function mount(root, { open: ready }) {
       d.close();
     });
     showDialog(d);
-    if (!e) setTimeout(() => f.elements.account.focus(), 80);
+    if (!e) setTimeout(() => { const a = document.activeElement; if (!a || a === d || a === document.body || !d.contains(a)) f.elements.account.focus(); }, 80);
   }
 
   // Change passphrase / hint (forced after unlocking with the recovery code)
@@ -486,8 +486,9 @@ export function mount(root, { open: ready }) {
       <div class="cred-set-rows">
         <button type="button" class="set-pot" data-pass><span>Change passphrase or hint</span>${icon("pen")}</button>
         <button type="button" class="set-pot" data-code><span>Make a new recovery code</span>${icon("key")}</button>
+        <label class="set-pot"><span>Import accounts from a file</span>${icon("plus")}<input type="file" accept=".json,application/json" hidden data-import></label>
       </div>
-      <p class="payer-sub">A new recovery code replaces the old one, which stops working.</p>
+      <p class="payer-sub">A new recovery code replaces the old one, which stops working. Imported accounts are encrypted on this phone as they're added — delete the file afterwards.</p>
       <div class="sheet-buttons"><button type="button" class="btn-ghost" data-done>Done</button></div>`);
     d.querySelector("[data-pass]").addEventListener("click", () => { d.close(); openPassphrase(false); });
     d.querySelector("[data-code]").addEventListener("click", async () => {
@@ -498,8 +499,56 @@ export function mount(root, { open: ready }) {
       d.close();
       showCode(r.code, false);
     });
+    d.querySelector("[data-import]").addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = "";
+      if (file) { d.close(); importFile(file); }
+    });
     d.querySelector("[data-done]").addEventListener("click", () => d.close());
     showDialog(d);
+  }
+
+  // ---------- Import a file of accounts ----------
+  // { "accounts": [ { "account", "email", "username", "password", "pin", "memorable" } ] }
+  // Each account is encrypted here before saving. An account whose name matches
+  // one you already have updates it (blank fields in the file keep what's there).
+  async function importFile(file) {
+    let rows;
+    try {
+      const data = JSON.parse(await file.text());
+      rows = Array.isArray(data) ? data : data.accounts;
+      if (!Array.isArray(rows)) throw new Error();
+    } catch {
+      await confirmDialog("That file isn't a PocketVault credentials file, so nothing was imported.", "OK", null, "Import");
+      return;
+    }
+    const clean = rows.map((r) => Object.fromEntries(FIELDS.map(([k]) => [k, String(r && r[k] != null ? r[k] : "").trim()])))
+      .filter((r) => r.account);
+    if (!clean.length) { await confirmDialog("No accounts were found in that file.", "OK", null, "Import"); return; }
+    const byName = new Map(entries.filter((e) => !e.broken).map((e) => [e.account.trim().toLowerCase(), e]));
+    const updates = clean.filter((r) => byName.has(r.account.toLowerCase())).length;
+    const adds = clean.length - updates;
+    const msg = `Add ${adds} account${adds === 1 ? "" : "s"}` + (updates ? ` and update ${updates} you already have (matched by name)` : "") +
+      "? Each one is encrypted on this phone before it's saved. Delete the file from your phone afterwards.";
+    if (!(await confirmDialog(msg, "Import", "Cancel", "Import accounts"))) return;
+    if (!session) return;
+    try {
+      const ops = [];
+      for (const r of clean) {
+        const old = byName.get(r.account.toLowerCase());
+        const merged = old ? { ...Object.fromEntries(FIELDS.map(([k]) => [k, r[k] || old[k] || ""])), account: old.account } : r;
+        ops.push([old ? fsDoc(credCol(), old.id) : fsDoc(credCol()), { ...(await encryptEntry(session.key, merged)), at: Date.now() }]);
+      }
+      for (let i = 0; i < ops.length; i += 400) {
+        const batch = writeBatch(db);
+        ops.slice(i, i + 400).forEach(([ref, v]) => batch.set(ref, v));
+        await writeOffline(batch.commit());
+      }
+      await confirmDialog(`Done — ${clean.length} account${clean.length === 1 ? "" : "s"} imported. Now delete the file from your phone (e.g. from Downloads).`, "OK", null, "Import");
+    } catch (ex) {
+      console.error(ex);
+      await confirmDialog("Something went wrong saving the accounts — nothing may have been imported. Try again.", "OK", null, "Import");
+    }
   }
 
   // Leaving Credentials: stop live updates and close anything open.
